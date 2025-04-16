@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -15,6 +16,11 @@ import (
 
 const MODEL_NAME = "qwen2.5-coder:32b-instruct-q8_0"
 const OLLAMA_HOST = "localhost:11435"
+
+var (
+	True  = true
+	False = false
+)
 
 func main() {
 	ollamaHost := os.Getenv("OLLAMA_HOST")
@@ -34,7 +40,7 @@ func main() {
 		return scanner.Text(), true
 	}
 
-	tools := []ToolDefinition{ReadFileDefintion, ListFilesDefinition}
+	tools := []ToolDefinition{ReadFileDefintion, ListFilesDefinition, EditFileDefinition}
 	agent := NewAgent(client, getUserMessage, tools)
 	err = agent.Run(context.TODO())
 	if err != nil {
@@ -99,14 +105,14 @@ func (a *Agent) runInference(ctx context.Context, conversation []api.Message) ap
 	var responder string
 	handler := func(chat api.ChatResponse) error {
 		message := chat.Message
-		if len(message.ToolCalls) > 0 {
+		if message.ToolCalls != nil {
 			for _, call := range message.ToolCalls {
 				toolResp := a.executeTool(call.Function.Name, call.Function.Arguments)
 				responder = toolResp.Role
 				responseTokens = append(responseTokens, toolResp.Content)
 			}
 		}
-		if len(message.Content) > 0 {
+		if message.Content != "" {
 			fmt.Print(message.Content)
 			responseTokens = append(responseTokens, message.Content)
 			responder = chat.Message.Role
@@ -130,6 +136,7 @@ func (a *Agent) runInference(ctx context.Context, conversation []api.Message) ap
 		Model:    MODEL_NAME,
 		Messages: conversation,
 		Tools:    ollamaTools,
+		Stream:   &False,
 	}
 	err := a.client.Chat(ctx, chatRequest, handler)
 	if err != nil {
@@ -278,6 +285,62 @@ func ListFiles(input map[string]any) (string, error) {
 	return string(result), nil
 }
 
+var EditFileDefinition = ToolDefinition{
+	Name: "edit_file",
+	Description: `Make edits to a text file.
+
+Replaces 'old_str' with 'new_str' in the given file. 'old_str' and 'new_str' MUST be different from each other.
+
+If the file specified with path doesn't exist, it will be created.
+`,
+	InputSchema: EditFileInputSchema,
+	Function:    EditFile,
+}
+
+type EditFileInput struct {
+	Path   string `json:"path" jsonschema_description:"The path to the file"`
+	OldStr string `json:"old_str" jsonschema_description:"Text to search for - must match exactly and must only have one match exactly"`
+	NewStr string `json:"new_str" jsonschema_description:"Text to replace old_str with"`
+}
+
+var EditFileInputSchema = GenerateSchema[EditFileInput]()
+
+func EditFile(input map[string]any) (string, error) {
+	path, ok := input["path"].(string)
+	if !ok {
+		return "", fmt.Errorf("Did not provide a path properly")
+	}
+	oldStr, ok := input["old_str"].(string)
+	if !ok {
+		return "", fmt.Errorf("Did not provide a old_str properly")
+	}
+	newStr, ok := input["new_str"].(string)
+	if !ok {
+		return "", fmt.Errorf("Did not provide a new_str properly")
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) && oldStr == "" {
+			return createNewFile(path, newStr)
+		}
+		return "", err
+	}
+
+	oldContent := string(content)
+	newContent := strings.Replace(oldContent, oldStr, newStr, -1)
+
+	if oldContent == newContent && oldStr != "" {
+		return "", fmt.Errorf("old_str not found in file")
+	}
+
+	err = os.WriteFile(path, []byte(newContent), 0644)
+	if err != nil {
+		return "", err
+	}
+
+	return "OK", nil
+}
 
 // Utils
 
@@ -336,4 +399,21 @@ func removeToolTokens(response string) string {
 	}
 
 	return response
+}
+
+func createNewFile(filePath, content string) (string, error) {
+	dir := path.Dir(filePath)
+	if dir != "." {
+		err := os.MkdirAll(dir, 0755)
+		if err != nil {
+			return "", fmt.Errorf("failed to create directory: %w", err)
+		}
+	}
+
+	err := os.WriteFile(filePath, []byte(content), 0644)
+	if err != nil {
+		return "", fmt.Errorf("failed to create file: %w", err)
+	}
+
+	return fmt.Sprintf("Successfully created file %s", filePath), nil
 }
